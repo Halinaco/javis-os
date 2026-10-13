@@ -180,3 +180,8 @@ server/channel_accounts.json
 
 # Bộ đo tai nghe (tools/stt_bench): clip âm thanh và kết quả, không lên git
 server/stt_bench/
+
+# Cấu hình cá nhân và script khởi động
+server/coding.json
+server/tg_sid.json
+start-javis.sh
