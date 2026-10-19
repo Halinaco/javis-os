@@ -10,6 +10,9 @@
   const editor = document.getElementById("studioEditor");
   const brain = () => (window.currentBrainPath ? currentBrainPath() : "brain");
   const esc = (s) => (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  // 0.214.0: the (i) button and its hidden block (info-tip.js); without it the text is drawn open.
+  const infoBtn = () => (window.JavisInfo ? window.JavisInfo.btn(t("info.more")) : "");
+  const infoBody = (html) => (window.JavisInfo ? window.JavisInfo.body(html) : `<div class="info-body">${html}</div>`);
   const api = async (p, o) => {
     // Timeout 12s → loader hiện trạng thái rỗng thay vì kẹt "Đang tải..." mãi nếu server chậm/treo.
     const ctrl = new AbortController();
@@ -138,6 +141,8 @@
     editAgent: editAgent, editWorkflow: editWorkflow, exportItem: exportItem, importItems: importItems,
     // Trang Models gọi sau khi cắm/ngắt key: ô chọn model trong form trợ lý dựng từ /settings.
     quenForm: quenForm,
+    // Lọc/đếm tag của trang agent, để test chạy đúng mã thật (gọi lúc dùng: các hàm khai sau dòng này).
+    tags: () => ({ demTag, tagCap, locTheoNhom, khungNhomHtml, TAG_NONE }),
   };
   const _studioBtn = document.getElementById("studioOpenBtn");
   if (_studioBtn) _studioBtn.addEventListener("click", () => window.openStudio("workspace"));
@@ -182,25 +187,66 @@
     return m;
   }
 
+  // TAG của AGENT (0.100.0, docs/dev/agent-tags.md): agent mang nhiều tag thay cho một nhóm; quy trình
+  // và skill vẫn dùng nhóm. Cột phân loại của trang agent liệt kê tag (agent nhiều tag được đếm ở
+  // mỗi tag nhưng chỉ hiện MỘT lần trong danh sách) và "Chưa gắn tag". Gắn/bỏ tag làm ở trang Cộng sự.
+  // Giá trị lọc "Chưa gắn tag": bắt đầu bằng dấu cách nên không bao giờ trùng tên tag thật (server cắt
+  // khoảng trắng hai đầu), và đi qua thuộc tính data-cat mà không bị trình duyệt đổi (khác ký tự NUL).
+  const TAG_NONE = " none";
+  const tagsCua = (x) => (x && Array.isArray(x.tags)) ? x.tags.map(String)
+    : ((g) => (g && g !== NHOM_MD ? [g] : []))(String((x && x.group) || "").trim());
+  // Khoá định danh do HOST cấp (`tag_keys`, Unicode casefold ở server), cùng định nghĩa với trang Cộng sự và
+  // server (review PR #617 vòng 1, R3). NFC + toLowerCase chỉ là đường lùi cho server cũ chưa trả `tag_keys`.
+  // `state.cat` của trang agent giữ KHOÁ; "ALL" viết hoa không thể là khoá casefold nên không trùng tag thật.
+  const khoaTag = (s) => { let v = String(s == null ? "" : s); try { v = v.normalize("NFC"); } catch (e) {} return v.toLowerCase(); };
+  const tagCap = (x) => {
+    const tg = tagsCua(x);
+    const ks = x && Array.isArray(x.tag_keys) && x.tag_keys.length === tg.length ? x.tag_keys.map(String) : null;
+    return tg.map((g, i) => ({ ten: g, key: ks ? ks[i] : khoaTag(g) }));
+  };
+  function demTag(items) {
+    const m = new Map(); let khong = 0;
+    (items || []).forEach(x => {
+      const cap = tagCap(x);
+      if (!cap.length) khong++;
+      cap.forEach(p => { if (!m.has(p.key)) m.set(p.key, { ten: p.ten, key: p.key, n: 0 }); m.get(p.key).n++; });
+    });
+    return { tags: [...m.values()].sort((a, b) => a.ten.localeCompare(b.ten, LOC())), khong };
+  }
+
   // HTML của khung: cột nhóm + ô tìm + một chỗ trống (id=bodyId) để mỗi trang tự vẽ danh sách
-  // theo kiểu riêng của nó (thẻ agent, hàng workflow, thẻ skill).
+  // theo kiểu riêng của nó (thẻ agent, hàng workflow, thẻ skill). `o.laTag`: cột là TAG (trang agent).
   function khungNhomHtml(items, state, o) {
-    const dem = demNhom(items);
-    const cats = ["ALL"].concat(Object.keys(dem).sort((a, b) => a.localeCompare(b, LOC())));
-    const catHtml = cats.map(c => `<div class="gr-cat ${state.cat === c ? "sel" : ""}" data-cat="${esc(c)}"><span>${c === "ALL" ? esc(t("studio.all")) : esc(c)}</span><span class="n">${c === "ALL" ? items.length : dem[c]}</span></div>`).join("");
+    let cats, ten = (c) => c, so;
+    if (o.laTag) {
+      const d = demTag(items);
+      cats = ["ALL", TAG_NONE].concat(d.tags.map(g => g.key));
+      const n = new Map(d.tags.map(g => [g.key, g]));
+      so = (c) => c === TAG_NONE ? d.khong : (n.get(c) || { n: 0 }).n;
+      ten = (c) => c === TAG_NONE ? t("ws.tag_none") : (n.get(c) || { ten: c }).ten;
+    } else {
+      const dem = demNhom(items);
+      cats = ["ALL"].concat(Object.keys(dem).sort((a, b) => a.localeCompare(b, LOC())));
+      so = (c) => dem[c];
+    }
+    const tatCa = o.laTag ? t("ws.tag_all") : t("studio.all");
+    const catHtml = cats.map(c => `<div class="gr-cat ${state.cat === c ? "sel" : ""}" data-cat="${esc(c)}"><span>${c === "ALL" ? esc(tatCa) : esc(ten(c))}</span><span class="n">${c === "ALL" ? items.length : so(c)}</span></div>`).join("");
     return `<div class="gr">
-      <div class="gr-side"><div class="sec">${esc(t("studio.groups"))}</div>${catHtml}</div>
+      <div class="gr-side"><div class="sec">${esc(o.laTag ? t("studio.tags") : t("studio.groups"))}</div>${catHtml}</div>
       <div class="gr-main">
-        <div class="gr-bar"><h4>${state.cat === "ALL" ? esc(t("studio.all")) : esc(state.cat)}</h4><span class="cnt"></span>
+        <div class="gr-bar"><h4>${state.cat === "ALL" ? esc(tatCa) : esc(ten(state.cat))}</h4><span class="cnt"></span>
           <input id="${o.searchId}" placeholder="${esc(o.searchPh)}" value="${esc(state.q)}"></div>
         <div class="${o.bodyCls || ""}" id="${o.bodyId}"></div>
       </div></div>`;
   }
 
-  // Lọc theo nhóm đang chọn + ô tìm. `blob` trả chuỗi dùng để dò của một mục.
-  function locTheoNhom(items, state, blob) {
+  // Lọc theo nhóm (hay tag, khi `laTag`) đang chọn + ô tìm. `blob` trả chuỗi dùng để dò của một mục.
+  function locTheoNhom(items, state, blob, laTag) {
     let list = items || [];
-    if (state.cat !== "ALL") list = list.filter(x => nhomCua(x) === state.cat);
+    if (laTag) {
+      if (state.cat === TAG_NONE) list = list.filter(x => !tagsCua(x).length);
+      else if (state.cat !== "ALL") list = list.filter(x => tagCap(x).some(p => p.key === state.cat));
+    } else if (state.cat !== "ALL") list = list.filter(x => nhomCua(x) === state.cat);
     const nq = _spNoAccent((state.q || "").trim());
     if (nq) list = list.filter(x => nq.split(/\s+/).every(word => _spNoAccent(blob(x)).includes(word)));
     return list;
@@ -294,13 +340,15 @@
     cards.innerHTML = "";
     wfs.forEach(w => {
       const active = w.status === "active";
+      // A long description shows two lines on the card; the full text sits behind the (i) next to the name.
+      const dai = String(w.description || "").length > 80;
       const div = document.createElement("div");
       div.className = "wf-row" + (active ? "" : " archived");
       div.dataset.slug = w.slug;
       div.innerHTML = `
         <div class="wf-header">
           <input type="checkbox" class="wf-sel" data-slug="${esc(w.slug)}" title="${esc(t("studio.sel_one"))}">
-          <div class="wf-name">${esc(w.name)}</div>
+          <div class="wf-name">${esc(w.name)}${dai ? infoBtn() : ""}</div>
           <span class="wf-badge ${active ? "ready" : "off"}">${esc(active ? t("studio.ready") : t("studio.archived"))}</span>
           <span class="wf-group">${ic("folder-open")} ${esc(nhomCua(w))}</span>
           <span class="wf-count">${(w.steps || []).length} ${esc(t("studio.steps"))}</span>
@@ -313,7 +361,8 @@
             <button class="s-btn-ghost del">${esc(t("common.delete"))}</button>
           </div>
         </div>
-        ${w.description ? `<div class="wf-desc">${esc(w.description)}</div>` : ''}
+        ${w.description ? `<div class="wf-desc${dai ? " j-clamp2" : ""}">${esc(w.description)}</div>` : ''}
+        ${dai ? infoBody(esc(w.description)) : ""}
         <div class="wf-pipeline">${renderPipeline(w.steps)}</div>`;
       noiSel("workflow", "wfDl", div.querySelector(".wf-sel"), w.slug);
       div.querySelector(".exp").onclick = () => exportItem("workflow", w.slug);
@@ -603,13 +652,13 @@
   }
 
   const _agFiltered = () => locTheoNhom(_agState.agents, _agState,
-    (a) => `${a.name} ${a.slug} ${a.role || ""}`);
+    (a) => `${a.name} ${a.slug} ${a.role || ""} ${tagsCua(a).join(" ")}`, true);
 
   function renderAgentUI() {
     const panel = document.getElementById("panel-agents");
     const all = _agState.agents;
     panel.innerHTML = `<div class="panel-bar"><h3>${esc(t("page.workspace.label"))}</h3><div class="pb-actions"><button class="s-btn-ghost" id="agSelAll" title="${esc(t("studio.selall_title"))}">${esc(t("studio.selall"))}</button><button class="s-btn-ghost" id="agDl" disabled title="${esc(t("studio.dl_title"))}">${esc(t("studio.dl_sel"))}</button><button class="s-btn-ghost" id="agImport">${esc(t("studio.import"))}</button><button class="s-btn" id="newAgent">+ ${esc(t("page.workspace.label"))}</button></div></div>
-      ${all.length ? khungNhomHtml(all, _agState, { bodyId: "agCards", bodyCls: "cards",
+      ${all.length ? khungNhomHtml(all, _agState, { bodyId: "agCards", bodyCls: "cards", laTag: true,
                                                     searchId: "agSearch", searchPh: t("studio.ag_search_ph") })
       : `<div class="empty">${esc(t("studio.ag_empty"))}</div>`}`;
     document.getElementById("newAgent").onclick = () => editAgent(null);
@@ -631,7 +680,7 @@
     cards.innerHTML = "";
     list.forEach(a => {
       const div = document.createElement("div"); div.className = "ag-card";
-      div.innerHTML = `<div class="ag-name"><input type="checkbox" class="ag-sel" data-slug="${esc(a.slug)}" title="${esc(t("studio.sel_one"))}"> ${ic("bot")} ${esc(a.name)} <span class="ag-model">${esc(a.model || "")}</span></div><div class="ag-role">${esc(a.role)}</div><div class="ag-skills">${(a.skills || []).map(s => `<span class="chip-skill">${esc(s)}</span>`).join("") || `<span class="dim">${esc(t("studio.no_skills"))}</span>`}</div><div class="ag-group">${ic("folder-open")} ${esc(nhomCua(a))}</div><div class="wf-actions"><button class="s-btn-ghost edit">${esc(t("common.edit"))}</button><button class="s-btn-ghost exp" title="${esc(t("studio.export_title"))}">${esc(t("studio.export"))}</button><button class="s-btn-ghost del">${esc(t("common.delete"))}</button></div>`;
+      div.innerHTML = `<div class="ag-name"><input type="checkbox" class="ag-sel" data-slug="${esc(a.slug)}" title="${esc(t("studio.sel_one"))}"> ${ic("bot")} ${esc(a.name)} <span class="ag-model">${esc(a.model || "")}</span></div><div class="ag-role">${esc(a.role)}</div><div class="ag-skills">${(a.skills || []).map(s => `<span class="chip-skill">${esc(s)}</span>`).join("") || `<span class="dim">${esc(t("studio.no_skills"))}</span>`}</div><div class="ag-group">${ic("tag")} ${tagsCua(a).length ? tagsCua(a).map(g => `<span class="chip-tag">${esc(g)}</span>`).join("") : `<span class="dim">${esc(t("ws.tag_none"))}</span>`}</div><div class="wf-actions"><button class="s-btn-ghost edit">${esc(t("common.edit"))}</button><button class="s-btn-ghost exp" title="${esc(t("studio.export_title"))}">${esc(t("studio.export"))}</button><button class="s-btn-ghost del">${esc(t("common.delete"))}</button></div>`;
       noiSel("agent", "agDl", div.querySelector(".ag-sel"), a.slug);
       div.querySelector(".exp").onclick = () => exportItem("agent", a.slug);
       div.querySelector(".edit").onclick = () => editAgent(a);
@@ -704,15 +753,25 @@
     if (opts.host && !box.isConnected) return;
     let avatar = window.JavisAvatar ? (a ? window.JavisAvatar.of(a) : window.JavisAvatar.random()) : null;
     box.classList.add("agent-editor");
-    box.innerHTML = `<h3>${esc(a ? t("studio.edit") : t("studio.create"))} Agent</h3>
+    // 0.175.0: câu giải thích dài của Tài liệu và Model nằm sau nút i cạnh nhãn (info-tip.js); câu báo việc cần làm (chưa
+    // lưu nên chưa gắn tài liệu được, chưa kết nối nhà cung cấp nào) vẫn hiện thẳng.
+    const JI = window.JavisInfo;
+    // 0.193.0: the assistant's own reasoning level (default medium) and, from a team, a button to message it privately.
+    const REASONING = [["off", "models.r_off"], ["low", "models.r_low"], ["medium", "models.r_med"], ["high", "models.r_high"],
+      ["xhigh", "models.r_xhigh"], ["ultra", "models.r_ultra"]];
+    const curReason = (a && a.reasoning) || "medium";
+    const chatBtn = opts.chatButton && a && a.slug
+      ? `<button type="button" class="s-btn-ghost ag-chat-btn" id="agChat">${ic("message-circle")} ${esc(t("studio.chat_private"))}</button>` : "";
+    box.innerHTML = `<div class="ag-head"><h3>${esc(a ? t("studio.edit") : t("studio.create"))} Agent</h3>${chatBtn}</div>
       <div class="agent-avatar-picker" id="agAvatar"></div>
       <label>${esc(t("studio.name"))}</label><input id="agName" value="${esc(a ? a.name : "")}">
       <label>${esc(t("studio.role"))}</label><input id="agRole" value="${esc(a ? a.role : "")}">
-      <label for="agAssets">${esc(t("studio.assets"))}</label>
+      <label for="agAssets">${esc(t("studio.assets"))}${a && a.slug && JI ? JI.btn(t("info.more")) : ""}</label>
       <div class="ag-assets">
         <button type="button" class="s-btn-ghost" id="agAssets"${a && a.slug ? "" : " disabled"}>${ic("paperclip")} ${esc(t("studio.assets_open"))}</button>
-        <div class="dim ag-assets-hint">${esc(a && a.slug ? t("studio.assets_hint") : t("studio.assets_new"))}</div>
+        ${a && a.slug && JI ? "" : `<div class="dim ag-assets-hint">${esc(a && a.slug ? t("studio.assets_hint") : t("studio.assets_new"))}</div>`}
       </div>
+      ${a && a.slug && JI ? JI.body(`<div class="dim ag-assets-hint">${esc(t("studio.assets_hint"))}</div>`) : ""}
       <label>${esc(t("studio.sys_prompt"))}</label><textarea id="agPrompt" rows="4">${esc(a ? (a.prompt || "") : "")}</textarea>
       <label>Skills</label>
       ${skills.length ? `<div class="sp-box">
@@ -721,7 +780,7 @@
           <button type="button" class="s-btn-ghost sp-clear" id="spClear">${esc(t("studio.sp_clear"))}</button></div>
         <div class="sp-groups" id="skillPick"></div>
       </div>` : `<div class="skill-pick"><span class="dim">${esc(t("studio.sp_none"))}</span></div>`}
-      <label for="agModelBtn">Model</label>
+      <label for="agModelBtn">Model${coKetNoi && JI ? JI.btn(t("info.more")) : ""}</label>
       <div class="ag-model-pick" id="agModelPick">
         <button type="button" class="ag-model-btn" id="agModelBtn">
           <span id="agModelTxt">${esc(nhanModel())}</span>${ic("chevron-down")}
@@ -729,9 +788,11 @@
         <input type="hidden" id="agModel" value="${esc(mModel ? val(mProv, mModel) : "")}">
         <div class="mb-pop ag-model-pop" id="agModelPop" hidden></div>
       </div>
-      <div class="dim" style="font-size:12px;margin-top:4px">${esc(coKetNoi
-        ? t("studio.model_hint")
-        : t("studio.model_none"))}</div>
+      ${coKetNoi && JI ? JI.body(`<div class="dim" style="font-size:12px">${esc(t("studio.model_hint"))}</div>`)
+        : `<div class="dim" style="font-size:12px;margin-top:4px">${esc(coKetNoi ? t("studio.model_hint") : t("studio.model_none"))}</div>`}
+      <label for="agReasoning">${esc(t("studio.reasoning"))}${JI ? JI.btn(t("info.more")) : ""}</label>
+      <select id="agReasoning">${REASONING.map(([v, k]) => `<option value="${v}"${v === curReason ? " selected" : ""}>${esc(t(k))}</option>`).join("")}</select>
+      ${infoBody(`<div class="dim" style="font-size:12px">${esc(t("studio.reasoning_hint"))}</div>`)}
       <div class="editor-actions"><button class="s-btn-ghost" id="cancelEd"${opts.host ? ' style="display:none"' : ""}>${esc(t("common.cancel"))}</button><button class="s-btn" id="saveAg">${esc(t("common.save"))}</button></div>`;
     if (window.JavisAvatar) window.JavisAvatar.picker(box.querySelector("#agAvatar"), avatar, v => { avatar = v; });
     // TÀI LIỆU & LINK của trợ lý: mở ĐÚNG ngăn kéo mà project và cuộc trò chuyện đang dùng
@@ -827,6 +888,11 @@
     // nó đã bị ẩn ở trên; giữ handler để bấm nhầm bằng bàn phím cũng không đóng modal người
     // khác đang mở.
     box.querySelector("#cancelEd").onclick = () => { if (opts.host) return; moDong(false); };
+    const nutChat = box.querySelector("#agChat");
+    if (nutChat) nutChat.onclick = () => {
+      moDong(false);
+      if (window.JavisWorkspace && window.JavisWorkspace.openCommand) window.JavisWorkspace.openCommand("agent", a.slug);
+    };
     box.querySelector("#saveAg").onclick = async () => {
       const name = box.querySelector("#agName").value.trim(); if (!name) return alert(t("studio.need_name"));
       const sk = [...chosen].join(",");
@@ -841,6 +907,7 @@
         // người dùng vừa đổi ở cột trái. Server thấy thiếu field là giữ nguyên nhóm đang có.
         const saved = await api("/agents", { method: "POST", body: fd({ name, role: box.querySelector("#agRole").value,
           prompt: box.querySelector("#agPrompt").value, skills: sk, model: mName, model_provider: mProv,
+          reasoning: (box.querySelector("#agReasoning") || {}).value || "medium",
           slug: a ? a.slug : "", brain: brain(), ...(avatar ? window.JavisAvatar.formFields(avatar) : {}) }) });
         if (!saved.ok) { alert(loiLuu(saved.error)); return; }
         moDong(false);
@@ -948,7 +1015,8 @@
     .gr-bar input{flex:1;min-width:160px;max-width:340px;padding:7px 11px;border-radius:8px;border:1px solid var(--hairline);background:var(--field-bg);color:var(--text);font-size:15px;outline:none}
     /* Nhãn nhóm trên thẻ agent và hàng workflow: nhìn thẻ là biết nó thuộc nhóm nào, khỏi phải
        mở form ra xem. Cùng biểu tượng thư mục với dòng nhóm ở thẻ skill. */
-    .ag-group{color:var(--text3);font-size:13px;margin-top:7px;display:flex;align-items:center;gap:5px}
+    .ag-group{color:var(--text3);font-size:13px;margin-top:7px;display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:0}
+    .ag-group .chip-tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;padding:1px 7px;border-radius:9px;background:var(--surface-2);color:var(--text2)}
     .wf-group{color:var(--text3);font-size:13px;display:inline-flex;align-items:center;gap:4px;flex:none}
     .sk2-list{display:flex;flex-direction:column;gap:8px;flex:1;min-width:0}
     /* .sk2-list là flex cột, nên hàng phân trang phải tự căn giữa - để mặc định nó dính mép
@@ -999,11 +1067,11 @@
     .sk3-bulk-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
     .sk3-bulk-row strong{font-size:14.5px;margin-right:auto}
     .sk3-bulk-row.sub{font-size:13px}
-    .sk3-bulk-hint{margin-right:auto;opacity:.78;flex:1 1 260px;line-height:1.45}
     .sk3-bulk button{height:34px;padding:0 12px;border-radius:8px;border:1px solid color-mix(in srgb, var(--bg) 35%, transparent);background:transparent;color:var(--bg);font-size:13.5px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
     .sk3-bulk button.main{border:0;background:var(--accent-solid);color:var(--on-accent);font-weight:600;height:38px;padding:0 16px;font-size:14px}
     .sk3-bulk button.link{border:0;text-decoration:underline}
     .sk3-bulk button:disabled{opacity:.55;cursor:wait}
+    .sk3-bulk .info-i{height:20px;padding:0;border:0;color:inherit;opacity:.8}   /* (i) on the dark bar, not a bar button */
     .sk3-detail{flex:0 0 360px;max-width:400px;box-sizing:border-box;display:flex;flex-direction:column;gap:16px;padding:18px;border:1px solid var(--hairline);border-radius:14px;background:var(--panel-solid);box-shadow:var(--shadow-2)}
     .sk3-detail[hidden],.sk3-scrim[hidden],#skBulk[hidden],.sk3-d-sec[hidden]{display:none}   /* display:flex đè thuộc tính hidden */
     .sk3-d-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
@@ -1026,7 +1094,6 @@
     .sk3-d-act button{height:40px;padding:0 14px;border-radius:9px;font-size:14px;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--hairline);background:var(--panel-solid);color:var(--text)}
     .sk3-d-act button.pri{border:0;background:var(--accent-solid);color:var(--on-accent);font-weight:600}
     .sk3-d-act button.del{margin-left:auto;border:0;background:transparent;color:var(--red)}
-    .sk3-d-act .sk3-sysnote{flex-basis:100%;margin:0;font-size:12.5px;line-height:1.5;color:var(--text3)}
     .sk3-scrim{position:fixed;inset:0;background:var(--scrim);z-index:59;display:none}
     /* Form sửa: một cột, nút Lưu ở cuối (chủ repo: trang cài đặt xếp một cột). */
     .sk3-form{display:flex;flex-direction:column;gap:18px;max-width:720px}
@@ -1067,7 +1134,6 @@
       .sk3-merged{display:none}
       .sk3-top{flex-wrap:wrap;gap:10px}
       .sk3-top h3{flex:1 1 100%}
-      .sk3-bulk-hint{flex-basis:100%;font-size:12.5px}
       .sk3-pick{width:44px}
       .sk3-pick input,.sk3-all input{width:20px;height:20px}
       .sk3-nm{font-size:16px}
@@ -1275,8 +1341,9 @@
     if (!n) { bar.hidden = true; bar.innerHTML = ""; return; }
     bar.hidden = false;
     bar.innerHTML = `<div class="sk3-bulk" role="region" aria-label="${esc(t("studio.sk_picked", { n }))}">
-      <div class="sk3-bulk-row"><strong>${esc(t("studio.sk_picked", { n }))}</strong><button type="button" class="main" id="skBulkExport">${ic("download")} ${esc(t("studio.sk_export_n", { n }))}</button></div>
-      <div class="sk3-bulk-row sub"><span class="sk3-bulk-hint">${esc(t("studio.sk_export_hint"))}</span><button type="button" id="skBulkOn">${esc(t("studio.sk_bulk_on"))}</button><button type="button" id="skBulkOff">${esc(t("studio.sk_bulk_off"))}</button><button type="button" class="link" id="skBulkClear">${esc(t("studio.sk_bulk_clear"))}</button></div></div>`;
+      <div class="sk3-bulk-row"><strong>${esc(t("studio.sk_picked", { n }))}${infoBtn()}</strong><button type="button" class="main" id="skBulkExport">${ic("download")} ${esc(t("studio.sk_export_n", { n }))}</button></div>
+      ${infoBody(esc(t("studio.sk_export_hint")))}
+      <div class="sk3-bulk-row sub"><button type="button" id="skBulkOn">${esc(t("studio.sk_bulk_on"))}</button><button type="button" id="skBulkOff">${esc(t("studio.sk_bulk_off"))}</button><button type="button" class="link" id="skBulkClear">${esc(t("studio.sk_bulk_clear"))}</button></div></div>`;
     document.getElementById("skBulkExport").onclick = () => taiDaChon("skill");
     document.getElementById("skBulkOn").onclick = () => batTatLoat(true);
     document.getElementById("skBulkOff").onclick = () => batTatLoat(false);
@@ -1368,8 +1435,9 @@
       : t("studio.sk_no_usage");
     const duongDan = (s.source === ".agents" ? ".agents/skills/" : "skills/") + s.slug + "/SKILL.md";
     box.innerHTML = `
-      <div class="sk3-d-head"><div><h4>${esc(s.name)}</h4><div class="sk3-d-sub">${esc(nhomCua(s))} · ${esc(s.system ? t("studio.sk_system_lbl") : t("studio.sk_by_you"))}</div></div>
+      <div class="sk3-d-head"><div><h4>${esc(s.name)}</h4><div class="sk3-d-sub">${esc(nhomCua(s))} · ${esc(s.system ? t("studio.sk_system_lbl") : t("studio.sk_by_you"))}${s.system ? infoBtn() : ""}</div></div>
         <button type="button" class="sk3-x" aria-label="${esc(t("studio.sk_close"))}">${ic("x")}</button></div>
+      ${s.system ? infoBody(esc(t("studio.sk_sys_note"))) : ""}
       <div class="sk3-d-state"><span>${esc(on ? t("studio.sk_state_on") : t("studio.sk_state_off"))}</span>
         <button type="button" class="sk3-sw" role="switch" aria-checked="${on}" aria-label="${esc(t("studio.sk_sw_aria", { ten: s.name }))}"><span class="sk3-tr"><span class="sk3-kn"></span></span></button></div>
       <section class="sk3-d-sec"><h5><span>${esc(t("studio.sk_desc_h"))}</span><span class="sk3-n${len > SKILL_DESC_MAX ? " over" : ""}">${esc(t("studio.sk_chars", { n: len, max: SKILL_DESC_MAX }))}</span></h5>
@@ -1380,7 +1448,7 @@
         <p class="sk3-path">${esc(t("studio.sk_file"))}: <code>${esc(duongDan)}</code></p></section>
       <details class="sk3-full"><summary>${esc(t("studio.sk_full"))}</summary><div class="sk3-md" id="skMd">${esc(t("common.loading"))}</div></details>
       <div class="sk3-d-act"><button type="button" class="pri" id="skDEdit">${ic("pencil")} ${esc(t("common.edit"))}</button>${s.system
-        ? `<p class="sk3-sysnote">${esc(t("studio.sk_sys_note"))}</p>`
+        ? ""
         : `<button type="button" id="skDExp" title="${esc(t("studio.export_title"))}">${ic("download")} ${esc(t("studio.sk_export_one"))}</button><button type="button" class="del" id="skDDel">${ic("trash-2")} ${esc(t("common.delete"))}</button>`}</div>`;
     box.querySelector(".sk3-x").onclick = dongChiTiet;
     const sw = box.querySelector(".sk3-sw");
@@ -1437,9 +1505,10 @@
           <select id="skGroupSel" class="js-input">${opts}</select>
           <input id="skGroupNew" class="js-input" placeholder="${esc(t("studio.sk_group_ph"))}" value="${esc(nhomChon ? "" : (sk.group || ""))}"${nhomChon ? " hidden" : ""}>
           <span class="hint">${esc(t("studio.sk_group_hint"))}</span></div>
-        <div class="fld"><div class="row"><label for="skDesc">${esc(t("studio.sk_desc_lbl"))}</label><span class="hint" id="skDescN"></span></div>
+        <div class="fld"><div class="row"><label for="skDesc">${esc(t("studio.sk_desc_lbl"))}${infoBtn()}</label><span class="hint" id="skDescN"></span></div>
           <textarea id="skDesc" class="js-input" style="min-height:76px">${esc(sk.description || "")}</textarea>
-          <span class="hint" id="skDescHint">${esc(t("studio.sk_desc_hint", { max: SKILL_DESC_MAX }))}</span></div>
+          ${infoBody(esc(t("studio.sk_desc_hint", { max: SKILL_DESC_MAX })))}
+          <span class="hint" id="skDescHint" hidden></span></div>
         <div class="fld"><div class="row"><span class="lbl">${esc(t("studio.sk_body_lbl"))}</span>
             <div class="tabs" role="tablist"><button type="button" role="tab" class="sel" aria-selected="true" data-tab="edit">${esc(t("studio.sk_tab_edit"))}</button><button type="button" role="tab" aria-selected="false" data-tab="preview">${esc(t("studio.sk_tab_preview"))}</button></div></div>
           <textarea id="skBody" class="js-input" aria-label="${esc(t("studio.sk_body_lbl"))}" style="min-height:260px;font-family:ui-monospace,monospace">${esc(sk.body || "")}</textarea>
@@ -1456,7 +1525,8 @@
       $("#skDescN").classList.toggle("over", over);
       desc.classList.toggle("over", over);
       const h = $("#skDescHint");
-      h.textContent = over ? t("studio.sk_desc_over", { n, max: SKILL_DESC_MAX }) : t("studio.sk_desc_hint", { max: SKILL_DESC_MAX });
+      h.textContent = over ? t("studio.sk_desc_over", { n, max: SKILL_DESC_MAX }) : "";
+      h.hidden = !over;
       h.classList.toggle("over", over);
       return over;
     };

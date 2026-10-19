@@ -113,7 +113,8 @@ User docs: [docs/en/10-models-and-engines.md](docs/en/10-models-and-engines.md).
   `substack_mcp.py`). `oauth_mcp.py` does MCP OAuth 2.1 so no engine needs a terminal login.
 - **Plugins.** `plugins_host.py` loads Python plugin folders (`plugin.yaml` + `plugin.py`) from,
   in order: `system/plugins/` (bundled), installed packs, `STATE_DIR/plugins/` (global user
-  plugins) and `<brain>/plugins/`. User plugins run only with `JAVIS_ENABLE_USER_PLUGINS=true`.
+  plugins) and `<brain>/plugins/`. User plugins load by default when their manifest is enabled;
+  `JAVIS_ENABLE_USER_PLUGINS=false` turns them off.
   Javis's own tools (`javis_task`, `javis_schedule`, `javis_ui`, ...) are bundled plugins.
 - **Packs.** `packs.py` loads extension packs from `STATE_DIR/packs/` so connectors and plugins
   can ship without a new release; `pack_install.py`, `packs_fetch.py` (HTTPS only, SSRF
@@ -131,6 +132,9 @@ operations index and media cleanup; Kanban has its own dispatcher.
 | Kanban tasks | `tasks.py`, `task_store.py` | `STATE_DIR/kanban.sqlite3` (+ JSON snapshot in `<brain>/Javis/kanban.json`) | Dispatcher claims tasks atomically and runs them as asyncio tasks |
 | Loops | `self_improve.py` | `<brain>/Javis/loops/<slug>.md`, state in `Javis/loop-state.json` | "Every X minutes find one unit of work"; run one at a time |
 | Reminders and cron jobs | `reminders.py`, `cron_util.py` | `<brain>/Javis/reminders.json` | Dependency-free 5-field cron parser |
+| Webhook triggers | `webhook_triggers.py` | `STATE_DIR/webhooks.json` (token hashes only) | `POST /hooks/<id>` runs a workflow or job from an outside event |
+| Incidents | `incident_desk.py` | `STATE_DIR/incidents.json` | A broken background run reaches Javis Core: retried once or the owner is told what to fix |
+| Health scan | `sentinel.py`, `tools/sentinel.py` | (read only) | Groups failures from every store by cause; runs without the server |
 | Workflows | `execute_workflow()` in `main.py`, `workflow_runtime.py`, `workflow_runs.py` | `<brain>/workflows/<slug>.md`, run history in SQLite | A chain of agent steps with checkpoints |
 | Self-learning | `learn.py`, `git_brain.py` | `<brain>/memory/` | The learning fork is read-only; only trusted Python writes, and only when the brain is a git checkout |
 | Results inbox | `inbox.py`, `webpush.py` | `STATE_DIR/inbox.json` | Every background result lands here, plus browser push |

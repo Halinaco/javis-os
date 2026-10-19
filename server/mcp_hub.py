@@ -34,6 +34,7 @@ import mcp_client
 import mcp_store
 import skill_router
 import skill_usage
+import team_gate
 import turn_context
 from config import STATE_DIR
 
@@ -99,7 +100,8 @@ def allow_patterns():
 # judge logged and retune the bot itself, so a customer must never reach them, not even through the lazy
 # `javis_run_tool`. `discover_all(for_bot=True)` drops them before the lazy tier; bot paths pass that flag (API
 # engines directly, Claude Code through the X-Javis-Bot header written by `claude_config_path(bot=True)`).
-OWNER_ONLY_TOOLS = frozenset({"javis_reply_policy", "javis_reply_policy_tune"})
+# `javis_team` (0.173.0) creates, edits and deletes team chats and writes assistant files: owner-only for the same reason.
+OWNER_ONLY_TOOLS = frozenset({"javis_reply_policy", "javis_reply_policy_tune", "javis_team", "javis_memory"})
 
 
 # ============================================================
@@ -218,14 +220,28 @@ def _guard(ent, fn, mode):
     async def _call(args):
         cls = mcp_catalog.classify(connector, tool, args)
         ok, why = mcp_catalog.allowed(connector, conn.get("perm"), mode, tool, args)
-        if ok and not _rate_ok(conn["id"], connector):
-            ok, why = False, (f"Kết nối '{conn.get('label')}' vượt giới hạn tần suất "
-                              f"(chống spam/khoá tài khoản). Chờ 1 phút rồi thử lại.")
+        gated_ask = False
+        if mode == team_gate.HUB_MODE and cls != "read":
+            # 0.207.0: a gated Team step. Anything that is not a read is an outside action (review: a custom
+            # connector's `send_email` is classed `write`, which `auto` would allow). The connection itself must allow
+            # it at full; then only the owner's approval of this exact call for this step lets it through
+            # (team_gate.py). No live gate means refused.
+            full_ok, full_why = mcp_catalog.allowed(connector, conn.get("perm"), "full", tool, args)
+            ok, why, gated_ask = (False, full_why, False) if not full_ok else (False, "", True)
+        if (ok or gated_ask) and not _rate_ok(conn["id"], connector):
+            ok, gated_ask = False, False
+            why = (f"Kết nối '{conn.get('label')}' vượt giới hạn tần suất "
+                   f"(chống spam/khoá tài khoản). Chờ 1 phút rồi thử lại.")
+        if gated_ask:
+            # Checked after the rate limit, so a refused call never burns the owner's approval.
+            ok, why = await asyncio.to_thread(team_gate.hub_check, fn, args,
+                                              f"{conn.get('label') or conn.get('connector_id') or ''}: {tool}")
+            why = why[len("ERROR: "):] if why.startswith("ERROR: ") else why
         if not ok:
             _audit_append({"ts": datetime.now().isoformat(timespec="seconds"), "conn_id": conn["id"],
                            "connector": conn.get("connector_id"), "label": conn.get("label"),
                            "tool": tool, "mode": mode, "cls": cls, "ok": False, "ms": 0,
-                           "err": why[:200], "args_keys": sorted((args or {}).keys())})
+                           "err": why[:200], "args_keys": sorted((args or {}).keys()), **team_gate.audit_fields()})
             return "ERROR: " + why
         t0 = time.time()
         result = await mcp_client.call_route({fn: {"spec": ent["spec"], "tool": tool}}, fn, args)
@@ -234,7 +250,7 @@ def _guard(ent, fn, mode):
                        "tool": tool, "mode": mode, "cls": cls,
                        "ok": not str(result).startswith("ERROR:"), "ms": int((time.time() - t0) * 1000),
                        "err": str(result)[:200] if str(result).startswith("ERROR:") else "",
-                       "args_keys": sorted((args or {}).keys())})
+                       "args_keys": sorted((args or {}).keys()), **team_gate.audit_fields()})
         # Lỗi từ dịch vụ trả về NGUYÊN VĂN tiếng Anh thì model phải tự đoán, và nó đoán sai:
         # vụ 2026-07-30 Google trả "The caller does not have permission", model kết luận là hub
         # của Javis chặn quyền rồi đi sửa nhầm tầng. GẮN THÊM chẩn đoán (không thay thế - giữ
@@ -639,6 +655,35 @@ def _builtin_tools(mode, vault_root, include_ambient=False, hidden=None, lang=""
                         f"trong số đó.")
             return (f"ERROR: '{(args or {}).get('path')}' nằm ngoài bộ não đang làm việc nên "
                     f"tool này không ghi được. Dùng đường dẫn tương đối trong brain.")
+        # 0.188.0 (Javis Core spec 13, 14): the learning switch and the forgotten list are the person's, never the
+        # model's; and with learning off nothing new is written under memory/.
+        try:
+            import memory_control
+            mem = (Path(vault_root) / "memory").resolve()
+            rp = p.resolve()
+            if rp.parent == mem and rp.name in (memory_control.LEARNING, memory_control.FORGOTTEN):
+                return "ERROR: công tắc ghi nhớ và danh sách đã quên do người dùng quản lý, tool không ghi được."
+            if (rp == mem or mem in rp.parents) and not memory_control.learning_enabled(mem):
+                return ("ERROR: người dùng đã TẮT việc lưu ghi nhớ mới cho brain này nên không ghi vào memory/. "
+                        "Nói với người dùng rằng ghi nhớ đang tắt (bật lại ở Javis Core > Trí nhớ).")
+        except Exception:
+            pass
+        if mode == team_gate.HUB_MODE:
+            # 0.207.0 review: a gated Team step writes its deliverables, never files that run or configure code
+            # (plugins/, .claude/, Javis/ loops and reminders...). Those go through the owner's approval like any action.
+            rel = None
+            for base in [vault_root] + list(workspace_root if isinstance(workspace_root, (list, tuple)) else
+                                            ([workspace_root] if workspace_root else [])):
+                try:
+                    rel = p.resolve().relative_to(Path(base).resolve())
+                    break
+                except (ValueError, TypeError, OSError):
+                    continue
+            if rel is None or team_gate.protected_rel(rel):
+                ok, why = await asyncio.to_thread(team_gate.hub_check, "javis_write_file", dict(args or {}),
+                                                  f"ghi {(args or {}).get('path')}")
+                if not ok:
+                    return why
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(str((args or {}).get("content") or ""), encoding="utf-8")
         return f"Đã ghi {p.name} ({len(str((args or {}).get('content') or ''))} ký tự)"
@@ -1097,15 +1142,20 @@ async def discover_all(mode="full", vault_root=None, include_plugins=True, inclu
             continue
         conn = raw["conn"]
         connector = mcp_catalog.get(conn.get("connector_id"))
-        eff = mcp_catalog.effective_perm(conn.get("perm"), mode)
+        # A gated Team step (0.207.0) lists like full: an outside action must be callable so the gate can stop it and
+        # turn it into an approval request, and run it once approved. The call itself is still capped (`_guard`).
+        eff = mcp_catalog.effective_perm(conn.get("perm"), "full" if mode == team_gate.HUB_MODE else mode)
         # Tool ĐA HÀNH ĐỘNG (schema có tham số arg_rules.param, vd action của Pancake) → coi là
         # "read" lúc LIST để còn liệt kê được; chặn thật lúc call (đã có args). Tool thường →
         # phân loại tĩnh theo tool_meta/heuristic.
+        # Tool có `call_rules` → classify(args=None) trả mức NHẸ NHẤT luật cho ra (call_rule_floor):
+        # tool gộp chỉ toàn lệnh ghi như GitHub `label_write` thì không hiện ở mức Chỉ đọc.
         rules = (connector or {}).get("arg_rules") or {}
         props = ((t.get("schema") or {}).get("properties") or {})
-        multiplexed = (bool(rules.get("param") and rules["param"] in props)
-                       or mcp_catalog.call_rule(connector, raw["tool"]) is not None)
-        cls = "read" if multiplexed else mcp_catalog.classify(connector, raw["tool"], None)
+        theo_lenh = mcp_catalog.call_rule(connector, raw["tool"]) is not None
+        multiplexed = bool(rules.get("param") and rules["param"] in props) or theo_lenh
+        cls = ("read" if multiplexed and not theo_lenh
+               else mcp_catalog.classify(connector, raw["tool"], None))
         # Lọc lúc LIST: readonly ẩn tool ghi/nguy hiểm tĩnh; safe ẩn tool nguy hiểm tĩnh.
         if (eff == "readonly" and cls in ("write", "danger")) or (eff == "safe" and cls == "danger"):
             h = hidden.setdefault(conn["id"], {"perm": eff, "ns": conn.get("namespace"), "tools": []})
@@ -1247,6 +1297,32 @@ def _brain_duy_nhat() -> str:
         return str(ds[0])
 
 
+def _brain_tu_phien(ung) -> str:
+    """Đường dẫn tuyệt đối của brain ghi trong cột `sessions.brain`, hoặc "" nếu không dám tin.
+
+    Cột đó KHÔNG luôn là đường dẫn: phiên tạo trước 0.43.1, hay phiên mà dashboard tạo sớm qua
+    /sessions/{id}/model|project, giữ nguyên tên gọi tắt "brain" của brain mặc định (app.js::
+    currentBrainPath). Kiểm nó như đường dẫn thô thì "brain" không resolve được (#610), còn một
+    giá trị TƯƠNG ĐỐI như "." resolve theo cwd của tiến trình thành /app hay gốc repo - một thư
+    mục có thật nhưng không phải brain nào cả, tức đúng kiểu chạy nhầm brain mà luật fail-closed
+    sinh ra để chặn. Nên: "brain" -> Brain Default (cùng quy ước `main._brain_root`), đường dẫn
+    TUYỆT ĐỐI có thật -> chính nó, mọi thứ khác -> "" để rơi về các nấc suy luận sau.
+    """
+    raw = str(ung or "").strip()
+    if not raw:
+        return ""
+    if raw == "brain":
+        p = _brains_dir() / "Brain Default"
+    else:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            return ""
+    try:
+        return str(p.resolve()) if p.is_dir() else ""
+    except OSError:
+        return ""
+
+
 def quen_brain_dang_mo() -> None:
     """Xoá cache brain đang mở. Gọi sau khi đổi brain nếu cần hiệu lực ngay (test dùng)."""
     _BRAIN_CACHE.update({"ts": 0.0, "root": "", "nguon": ""})
@@ -1260,11 +1336,9 @@ def _brain_dang_mo() -> tuple:
     root, nguon = "", ""
     try:
         import sessions
-        ung = sessions.get_store().brain_gan_nhat()
+        ung = _brain_tu_phien(sessions.get_store().brain_gan_nhat())
         if ung:
-            p = Path(ung).expanduser()
-            if p.is_dir():
-                root, nguon = str(p.resolve()), "phien"
+            root, nguon = ung, "phien"
     except Exception as e:
         print(f"[hub brain] {type(e).__name__}: {e}", file=sys.stderr)
     if not root:
@@ -1310,11 +1384,20 @@ _NGUON_CHU = {"phien": "brain đang mở (cuộc trò chuyện gần nhất)",
               "duy-nhat": "brain duy nhất trên máy này"}
 
 
+def _ten_hien_brain(vault_root) -> str:
+    """Tên hiển thị của brain (0.219.0, brain_label), rơi về tên thư mục nếu không đọc được."""
+    try:
+        import brain_label
+        return brain_label.display(vault_root)
+    except Exception:
+        return Path(vault_root).name
+
+
 def _ghi_chu_brain(nguon, vault_root, header_hong):
     """Dòng gắn vào kết quả tool để người dùng luôn biết lượt đó chạy trên brain nào."""
     if nguon not in _NGUON_CHU:
         return ""
-    ra = (f"(Javis đang làm việc trên brain \"{Path(vault_root).name}\" - {vault_root}. "
+    ra = (f"(Javis đang làm việc trên brain \"{_ten_hien_brain(vault_root)}\" - {vault_root}. "
           f"Lượt gọi này tới hub không kèm header X-Javis-Vault nên hub lấy "
           f"{_NGUON_CHU[nguon]}. Muốn brain khác thì đổi brain trên dashboard, hoặc thêm "
           f"header X-Javis-Vault vào cấu hình MCP của client.)")
@@ -1651,6 +1734,25 @@ def codex_vault_override(vault_root):
     return f"{CODEX_VAULT_KEY}={_toml_str(ma_hoa_vault(vault))}"
 
 
+CODEX_MODE_KEY = "mcp_servers.javis.http_headers.X-Javis-Mode"
+_CODEX_MODES = ("suggest", "auto", "full", "gated")
+
+
+def dat_codex_mode(extra_config, mode):
+    """Pin the hub permission level of ONE Codex process with a `-c` override, replacing any earlier one.
+
+    The shared Codex profile is written with `X-Javis-Mode: full` (the chat path). Before 0.117.0 a
+    background job at suggest or auto (reminder, loop, Kanban) reached hub tools at FULL through that
+    profile, while Grok and Antigravity already got the job's own level. An unknown level falls back to
+    the strictest one, as every other mode mapping here does."""
+    m = str(mode or "full").strip().lower()
+    if m not in _CODEX_MODES:
+        m = "suggest"
+    extra_config[:] = [x for x in extra_config if not str(x).startswith(CODEX_MODE_KEY + "=")]
+    extra_config.append(f"{CODEX_MODE_KEY}={_toml_str(m)}")
+    return extra_config
+
+
 def dat_codex_vault(extra_config, vault_root):
     """Gắn override brain vào danh sách `-c` của MỘT CodexCLI, THAY override brain cũ nếu có.
 
@@ -1662,6 +1764,50 @@ def dat_codex_vault(extra_config, vault_root):
     override = codex_vault_override(vault_root)
     if override:
         extra_config.append(override)
+    return extra_config
+
+
+# Việc nền theo lịch chạy trên Codex: hub là server BẮT BUỘC.
+#
+# Codex 0.161.0 chụp danh sách tool của lượt và chỉ chờ một server MCP không `required` tới
+# `mcp_optional_startup_grace_ms`, mặc định 1 giây; quá hạn là cả server bị bỏ khỏi lượt đó
+# (codex-mcp/src/connection_manager/tool_catalog.rs). Hub trả `tools/list` qua `discover_all`,
+# cache 60 giây hết hạn là dò lại mọi connector, mất khoảng 2 giây. Hai con số đua nhau nên việc
+# nền lúc có tool hub lúc không (canary 08-09/10/2026: 4 trên 12 lượt nhắc hẹn không thấy
+# `mcp__javis__*`), model đi vòng qua app ChatGPT hoặc báo không làm được mà nhắc hẹn vẫn ghi xong.
+# `required = true` bắt Codex chờ hub tới `startup_timeout_sec` của profile; hub không lên thì
+# phiên không mở và `codex exec` thoát lỗi TRƯỚC khi gọi model (core/src/session/session.rs); câu
+# lỗi đó do claude_cli.codex_error_text đọc. Chỉ gắn khi profile hub có mặt: override vào
+# `mcp_servers.javis` mà thiếu entry đó thì Codex từ chối khởi động ("invalid transport").
+CODEX_REQUIRED_KEY = "mcp_servers.javis.required"
+# `features.apps = false` gỡ hẳn server `codex_apps` (app ChatGPT gắn với tài khoản,
+# codex-mcp/src/mcp/mod.rs). Tool của nó không đi qua hub nên không chịu mức quyền của việc, và
+# là đường vòng model từng chọn cả khi hub có mặt (canary 08/10/2026).
+CODEX_APPS_KEY = "features.apps"
+
+
+def dat_codex_hub_bat_buoc(extra_config):
+    """Gắn `required = true` cho entry hub vào `-c` của MỘT CodexCLI, THAY bản cũ nếu có."""
+    extra_config[:] = [x for x in extra_config if not str(x).startswith(CODEX_REQUIRED_KEY + "=")]
+    extra_config.append(f"{CODEX_REQUIRED_KEY}=true")
+    return extra_config
+
+
+def dat_codex_team_gated(extra_config):
+    """0.207.0: one Codex process of a GATED Team step (team_gate.py): hub level `gated` (the gate decides outside
+    actions), no ChatGPT apps (they bypass the hub) and no shell network in its workspace sandbox, whatever the user's
+    own Codex config says. Chat and workflow Codex processes never get this."""
+    dat_codex_mode(extra_config, "gated")
+    dat_codex_tat_app(extra_config)
+    extra_config[:] = [x for x in extra_config if not str(x).startswith("sandbox_workspace_write.network_access=")]
+    extra_config.append("sandbox_workspace_write.network_access=false")
+    return extra_config
+
+
+def dat_codex_tat_app(extra_config):
+    """Tắt app ChatGPT (`codex_apps`) cho MỘT CodexCLI, THAY bản cũ nếu có."""
+    extra_config[:] = [x for x in extra_config if not str(x).startswith(CODEX_APPS_KEY + "=")]
+    extra_config.append(f"{CODEX_APPS_KEY}=false")
     return extra_config
 
 

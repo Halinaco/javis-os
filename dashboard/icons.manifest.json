@@ -72,7 +72,12 @@
       "log-out",
       "eraser",
       "brush-cleaning",
-      "ellipsis-vertical"
+      "ellipsis-vertical",
+      "reply",
+      "thumbs-up",
+      "at-sign",
+      "square",
+      "ellipsis"
     ],
     "dieu-huong": [
       "chevron-down",
@@ -153,6 +158,7 @@
       "terminal",
       "git-branch",
       "bell",
+      "bell-off",
       "eye",
       "rocket",
       "layers",

@@ -155,9 +155,19 @@ def _conn() -> sqlite3.Connection:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=5000")
         db.executescript(_SCHEMA)
+        _nang_cap(db)
         db.commit()
         _db, _db_path = db, path
         return db
+
+
+def _nang_cap(db: sqlite3.Connection) -> None:
+    """Thêm cột cho kho cũ. `CREATE TABLE IF NOT EXISTS` không đụng bảng đã có, nên cột mới phải ALTER riêng."""
+    cot = {r[1] for r in db.execute("PRAGMA table_info(customers)").fetchall()}
+    if "phone" not in cot:
+        # 0.216.0: số điện thoại của khách (dạng 0xxxxxxxxx), để ô tìm kiếm của hòm thư tìm theo số.
+        db.execute("ALTER TABLE customers ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE INDEX IF NOT EXISTS ix_khach_sdt ON customers(phone) WHERE phone != ''")
 
 
 def close() -> None:
@@ -280,12 +290,15 @@ def _tai_khoan_id(kenh: str, account_id: str) -> str:
     return f"{kenh}:{account_id}"
 
 
-def ghi_su_kien(ev: dict) -> dict:
+def ghi_su_kien(ev: dict, dem_chua_doc: bool = True) -> dict:
     """Đổ MỘT sự kiện chuẩn vào kho: tìm/tạo tài khoản kênh, khách, hội thoại rồi thêm tin.
 
     Trả về {"ok": True, "conversation_id", "message_id", "customer_id", "trung": bool}.
     Tin trùng `external_message_id` trong cùng hội thoại thì `trung=True` và không ghi gì.
     Lỗi trả {"ok": False, "loi": ...} và KHÔNG ném: người gọi là lượt trả lời khách.
+
+    `dem_chua_doc=False` (0.174.0): tin NHẬP LẠI từ lịch sử (Zalo cá nhân, `nhap_lich_su`) không cộng vào số chưa đọc. Đó là tin
+    cũ đã đọc trên điện thoại; đếm vào là hàng trăm cuộc chat đỏ chót ngay sau một lần bấm.
     """
     e = chuan_hoa(ev)
     if e.get("loi"):
@@ -365,7 +378,7 @@ def ghi_su_kien(ev: dict) -> dict:
 
                 # 5. Cập nhật hội thoại: tin cuối, số tin, chưa đọc (chỉ đếm tin KHÁCH)
                 tom = e["text"].strip().replace("\n", " ")[:200] or f"[{e['message_type']}]"
-                them_chua_doc = 1 if e["sender_type"] == "customer" else 0
+                them_chua_doc = 1 if e["sender_type"] == "customer" and dem_chua_doc else 0
                 db.execute(
                     "UPDATE conversations SET last_message=?, last_message_at=?, last_sender_type=?,"
                     " unread_count=unread_count+?, message_count=message_count+1, updated_at=?"
@@ -384,6 +397,16 @@ def ghi_su_kien(ev: dict) -> dict:
     except Exception as ex:
         print(f"[conversations] ghi lỗi: {type(ex).__name__}: {ex}", file=sys.stderr)
         return {"ok": False, "loi": f"{type(ex).__name__}: {ex}"}
+
+
+def co_tin(kenh: str, account_id: str, external_chat_id: str) -> bool:
+    """Cuộc chat này đã có ít nhất một tin trong kho chưa (0.174.0, cho `zalo_personal_channel.nhap_lich_su`)."""
+    with _lock:
+        r = _conn().execute(
+            "SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id"
+            " WHERE c.channel_account_id=? AND c.external_chat_id=? LIMIT 1",
+            (_tai_khoan_id(kenh, account_id), str(external_chat_id))).fetchone()
+    return bool(r)
 
 
 def _cat_nhom_mot_cuoc(db, conv_id: int, giu: int = GIU_TIN_NHOM) -> int:
@@ -490,6 +513,30 @@ def tin_gan_day(channel: str, account_id: str, external_chat_id: str, limit: int
         return []
 
 
+def tin_theo_id(channel: str, account_id: str, external_chat_id: str, external_message_id: str) -> dict:
+    """ONE stored message of a chat by the channel's own message id, `metadata` already parsed; {} if absent.
+
+    Used to find the message a reply quotes (0.141.0, Zalo `replyTo.msgId`). Scoped to the same chat on purpose: a
+    quote never points across chats, and an id from another chat must not leak that chat's content. Never raises."""
+    mid = str(external_message_id or "").strip()
+    if not mid:
+        return {}
+    try:
+        with _lock:
+            r = _conn().execute(
+                "SELECT m.* FROM messages m JOIN conversations c ON c.id=m.conversation_id"
+                " WHERE c.channel_account_id=? AND c.external_chat_id=? AND m.external_message_id=? LIMIT 1",
+                (_tai_khoan_id(channel, account_id), str(external_chat_id), mid)).fetchone()
+        if r is None:
+            return {}
+        d = dict(r)
+        d["metadata"] = _loads(d.pop("metadata_json", "{}"), {})
+        return d
+    except Exception as ex:      # noqa: BLE001
+        print(f"[conversations] đọc tin theo id lỗi: {type(ex).__name__}: {ex}", file=sys.stderr)
+        return {}
+
+
 # ============================================================
 # Đọc
 # ============================================================
@@ -577,11 +624,17 @@ def danh_sach(channel: str = "", bot_id: str = "", account_id: str = "", q: str 
         where.append("c.mode=?"); args.append(str(mode))
     if q:
         like = f"%{str(q).strip()}%"
-        where.append("(k.name LIKE ? OR c.title LIKE ? OR c.external_chat_id LIKE ? OR c.last_message LIKE ?)")
+        dk = ["k.name LIKE ?", "c.title LIKE ?", "c.external_chat_id LIKE ?", "c.last_message LIKE ?"]
         args += [like, like, like, like]
+        # Gõ số điện thoại: khớp số đã lưu của khách theo cả dạng 0912... lẫn 84912..., và id cuộc chat của những kênh lấy
+        # chính số làm id (WhatsApp giữ 84912...). Viết cách quãng "0912 345 678" cũng khớp.
+        for v in bien_the_sdt(q):
+            dk += ["k.phone LIKE ?", "c.external_chat_id LIKE ?"]
+            args += [f"%{v}%", f"%{v}%"]
+        where.append("(" + " OR ".join(dk) + ")")
     sql = (
         "SELECT c.*, a.channel AS channel, a.display_name AS account_name,"
-        " k.name AS customer_name, k.external_user_id AS customer_external_id"
+        " k.name AS customer_name, k.external_user_id AS customer_external_id, k.phone AS customer_phone"
         " FROM conversations c"
         " JOIN channel_accounts a ON a.id=c.channel_account_id"
         " LEFT JOIN customers k ON k.id=c.customer_id"
@@ -959,8 +1012,11 @@ def danh_sach_khach(channel: str = "", tag: str = "", q: str = "", days: int = 0
         where.append("k.tags_json LIKE ?"); args.append('%"' + str(tag).replace('"', "") + '"%')
     if q:
         like = f"%{str(q).strip()}%"
-        where.append("(k.name LIKE ? OR k.external_user_id LIKE ? OR k.note LIKE ?)")
+        dk = ["k.name LIKE ?", "k.external_user_id LIKE ?", "k.note LIKE ?"]
         args += [like, like, like]
+        for v in bien_the_sdt(q):
+            dk.append("k.phone LIKE ?"); args.append(f"%{v}%")
+        where.append("(" + " OR ".join(dk) + ")")
     if days and int(days) > 0:
         where.append("k.updated_at>=?"); args.append(_now() - int(days) * 86400)
     sql = _SQL_KHACH + (" WHERE " + " AND ".join(where) if where else "") \
@@ -1012,6 +1068,84 @@ def dat_tag_khach(customer_id: int, tags) -> Optional[List[str]]:
                          (_json(sach), int(customer_id)))
         db.commit()
     return sach if cur.rowcount > 0 else None
+
+
+# ============================================================
+# Số điện thoại của khách (0.216.0)
+# ============================================================
+_SDT_TACH = re.compile(r"[\s.\-()]")
+
+
+def chuan_hoa_sdt(s: Any) -> str:
+    """Một số di động Việt Nam ĐẦY ĐỦ về dạng `0xxxxxxxxx`, hoặc "" nếu không phải.
+
+    Nhận "0912345678", "84912345678", "+84 912 345 678", "0912.345.678". Chỉ nhận số có đầu 0 hoặc 84: gõ dở
+    "849123456" không được coi là số 084..., kẻo ô tìm kiếm đi hỏi Zalo một số người dùng chưa gõ xong."""
+    t = _SDT_TACH.sub("", str(s or "").strip())
+    if not re.fullmatch(r"\+?\d+", t or "x"):
+        return ""
+    d = t.lstrip("+")
+    if d.startswith("84") and len(d) == 11 and d[2] in "35789":
+        return "0" + d[2:]
+    if d.startswith("0") and len(d) == 10 and d[1] in "35789":
+        return d
+    return ""
+
+
+def sdt_84(phone: str) -> str:
+    """`0912345678` -> `84912345678`, dạng Zalo và WhatsApp dùng."""
+    p = chuan_hoa_sdt(phone)
+    return "84" + p[1:] if p else ""
+
+
+def bien_the_sdt(q: Any) -> List[str]:
+    """Các cách viết của một (phần) số điện thoại để tìm bằng LIKE: chính dãy số, và dạng 0 <-> 84 tương ứng.
+
+    Chỉ khi `q` toàn số (cho phép dấu cách, chấm, gạch, ngoặc, dấu + đầu) và từ 4 chữ số trở lên; còn lại trả [] để chữ
+    thường không tìm nhầm vào cột số."""
+    t = _SDT_TACH.sub("", str(q or "").strip())
+    if not re.fullmatch(r"\+?\d{4,15}", t or "x"):
+        return []
+    d = t.lstrip("+")
+    out = [d]
+    if d.startswith("84") and len(d) > 4:
+        out.append("0" + d[2:])
+    elif d.startswith("0") and len(d) > 4:
+        out.append("84" + d[1:])
+    return out
+
+
+def gan_sdt_khach(channel: str, account_id: str, external_user_id: str, phone: str, name: str = "") -> Optional[int]:
+    """Gắn số điện thoại cho khách `external_user_id` của tài khoản kênh (`account_id` là id NGOÀI, như sự kiện mang).
+
+    Có cuộc chat riêng với người đó mà chưa có khách (chỉ chủ nhắn đi, khách chưa nhắn lại) thì tạo khách và nối vào
+    cuộc chat, để lần tìm sau khớp ngay. Không có cả khách lẫn cuộc chat thì không tạo gì: hòm thư chỉ hiện cuộc chat.
+    Trả id khách, hoặc None."""
+    p = chuan_hoa_sdt(phone)
+    uid = str(external_user_id or "").strip()
+    if not p or not uid:
+        return None
+    tk = _tai_khoan_id(channel, account_id)
+    now = _now()
+    with _lock:
+        db = _conn()
+        r = db.execute("SELECT id FROM customers WHERE channel_account_id=? AND external_user_id=?",
+                       (tk, uid)).fetchone()
+        conv = db.execute("SELECT id, customer_id FROM conversations WHERE channel_account_id=? AND external_chat_id=?"
+                          " AND chat_type='private'", (tk, uid)).fetchone()
+        if r:
+            kid = int(r[0])
+            db.execute("UPDATE customers SET phone=? WHERE id=?", (p, kid))
+        elif conv:
+            cur = db.execute("INSERT INTO customers(channel_account_id, external_user_id, name, phone, created_at,"
+                             " updated_at) VALUES(?,?,?,?,?,?)", (tk, uid, _s(name, MAX_TEN), p, now, now))
+            kid = int(cur.lastrowid)
+        else:
+            return None
+        if conv and not conv["customer_id"]:
+            db.execute("UPDATE conversations SET customer_id=? WHERE id=?", (kid, int(conv["id"])))
+        db.commit()
+    return kid
 
 
 def dat_ghi_chu_khach(customer_id: int, note: str) -> bool:

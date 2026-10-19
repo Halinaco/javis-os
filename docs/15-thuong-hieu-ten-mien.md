@@ -145,6 +145,8 @@ Dòng trạng thái dưới cùng của card có thể là:
 
 ## Nếu bạn deploy trên Hostinger (khác cách trên)
 
+> 🛒 Chưa có VPS Hostinger? [Đăng ký tại đây](https://www.hostinger.com?REFERRALCODE=UTRBLOGMIDSN).
+
 Hostinger VPS đã cài sẵn reverse proxy Traefik lo SSL, và cổng 80/443 đã bị Traefik chiếm. Javis vẫn cho nhập tên miền, kiểm tra DNS và tạo sẵn biến cần dùng ngay trên UI, nhưng container không có quyền sửa route Traefik của hPanel. Vì thế nút **Bật SSL** bị ẩn, badge SSL ghi **SSL: qua Hostinger**, và bước 3 của wizard đổi thành **3. Kích hoạt route HTTPS trên Hostinger**:
 
 1. Trỏ DNS: bản ghi `A  <tên miền của bạn> → <IP VPS Hostinger>`.
@@ -155,6 +157,21 @@ Hostinger VPS đã cài sẵn reverse proxy Traefik lo SSL, và cổng 80/443 đ
 Nếu bạn cố bấm Bật SSL trên Hostinger (ví dụ qua API), Javis từ chối và nói rõ: Hostinger quản lý HTTPS bằng Traefik, hãy đặt `DOMAIN_NAME` trong Docker Manager rồi Redeploy.
 
 Sau khi Redeploy, trở lại Cài đặt và bấm **Kiểm tra lại**. Chi tiết và xử lý sự cố xem mục "Tên miền + HTTPS trên Hostinger" trong `DEPLOY.md`; hai link tài liệu cũng nằm ngay dưới card tên miền.
+
+## Theme riêng cho người vận hành (CSS)
+
+Ai triển khai Javis cho khách (white-label) có thể đặt một file `theme.css` vào thư mục
+`branding/` trong thư mục dữ liệu của Javis (cạnh logo đã tải lên; Docker là
+`/data/state/branding/theme.css`). Có file này thì mọi trang dashboard tải nó SAU các file CSS
+gốc, nên nó đè được màu, font, bo góc. File nằm ngoài mã nguồn nên sống qua mọi lần cập nhật.
+Xoá file là về giao diện gốc. Trần 512 KB.
+
+- **Màu ở chế độ sáng:** biến màu của chế độ sáng khai trong `:root[data-theme="light"]`, đặc
+  hơn `:root`. Muốn đổi màu cho cả hai chế độ thì khai cả hai khối, ví dụ
+  `:root{--accent:#e4572e}` và `:root[data-theme="light"]{--accent:#e4572e}`.
+- **Chế độ mặc định:** thêm dòng `/* javis-default-mode: light */` (hoặc `dark`, `auto`) trong
+  4 KB đầu file để chọn sáng/tối cho thiết bị chưa từng tự chọn. Người dùng đã tự chọn thì giữ
+  lựa chọn của họ.
 
 ## Mẹo
 
